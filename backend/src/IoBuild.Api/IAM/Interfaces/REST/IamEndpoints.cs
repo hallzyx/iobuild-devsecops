@@ -14,13 +14,46 @@ public static class IamEndpoints
     {
         var group = app.MapGroup("/api/v1").WithTags("IAM");
 
-        group.MapPost("/users", async (RegisterUser request, IamService iam, CancellationToken ct) => { try { await iam.RegisterAsync(request, ct); return Results.Created("/api/v1/users", new { message = "User created successfully." }); } catch (InvalidOperationException) { return Results.BadRequest(new { error = "Invalid registration data." }); } }).AllowAnonymous();
-        group.MapPost("/authentication/sign-up", async (RegisterUser request, IamService iam, CancellationToken ct) => { try { await iam.RegisterAsync(request, ct); return Results.Created("/api/v1/authentication/sign-up", new { message = "User created successfully." }); } catch (InvalidOperationException) { return Results.BadRequest(new { error = "Invalid registration data." }); } }).AllowAnonymous();
+        group.MapPost("/users", async (RegisterUser request, IamService iam, IoBuildDbContext db, CancellationToken ct) =>
+        {
+            var rawEmail = request.Email?.Trim().ToLowerInvariant() ?? string.Empty;
+            if (!string.IsNullOrEmpty(rawEmail) && await db.IamUsers.AnyAsync(u => u.Email == rawEmail, ct))
+            {
+                return Results.Conflict(new { error = "An account with this email already exists." });
+            }
+            try { await iam.RegisterAsync(request, ct); return Results.Created("/api/v1/users", new { message = "User created successfully." }); }
+            catch (OwnerUnitAssignmentRequiredException)
+            {
+                return Results.Json(new { code = "owner_unit_assignment_required", error = "An assigned unit is required to register as an owner." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            catch (InvalidOperationException) { return Results.BadRequest(new { error = "Invalid registration data." }); }
+        }).AllowAnonymous();
+
+        group.MapPost("/authentication/sign-up", async (RegisterUser request, IamService iam, IoBuildDbContext db, CancellationToken ct) =>
+        {
+            var rawEmail = request.Email?.Trim().ToLowerInvariant() ?? string.Empty;
+            if (!string.IsNullOrEmpty(rawEmail) && await db.IamUsers.AnyAsync(u => u.Email == rawEmail, ct))
+            {
+                return Results.Conflict(new { error = "An account with this email already exists." });
+            }
+            try { await iam.RegisterAsync(request, ct); return Results.Created("/api/v1/authentication/sign-up", new { message = "User created successfully." }); }
+            catch (OwnerUnitAssignmentRequiredException)
+            {
+                return Results.Json(new { code = "owner_unit_assignment_required", error = "An assigned unit is required to register as an owner." }, statusCode: StatusCodes.Status403Forbidden);
+            }
+            catch (InvalidOperationException) { return Results.BadRequest(new { error = "Invalid registration data." }); }
+        }).AllowAnonymous();
 
         group.MapGet("/authentication/invitation", async (string? email, IoBuildDbContext db, CancellationToken ct) =>
         {
-            if (string.IsNullOrWhiteSpace(email)) return Results.Ok(new { assigned = false });
+            if (string.IsNullOrWhiteSpace(email)) return Results.Ok(new { assigned = false, alreadyRegistered = false });
             var normalized = email.Trim().ToLowerInvariant();
+
+            var alreadyRegistered = await db.IamUsers.AnyAsync(u => u.Email == normalized, ct);
+            if (alreadyRegistered)
+            {
+                return Results.Ok(new { assigned = false, alreadyRegistered = true });
+            }
 
             var client = await db.Clients
                 .FirstOrDefaultAsync(c => !string.IsNullOrEmpty(c.Email) && c.Email.ToLower() == normalized, ct);
@@ -28,9 +61,9 @@ public static class IamEndpoints
             var unit = await db.Units
                 .FirstOrDefaultAsync(u => (!string.IsNullOrEmpty(u.OwnerEmail) && u.OwnerEmail.ToLower() == normalized) || (client != null && client.UnitId == u.Id), ct);
 
-            if (client is null && unit is null)
+            if (unit is null)
             {
-                return Results.Ok(new { assigned = false });
+                return Results.Ok(new { assigned = false, alreadyRegistered = false });
             }
 
             var project = unit is not null
@@ -40,6 +73,7 @@ public static class IamEndpoints
             return Results.Ok(new
             {
                 assigned = true,
+                alreadyRegistered = false,
                 fullName = client?.FullName ?? string.Empty,
                 phoneNumber = client?.PhoneNumber ?? string.Empty,
                 address = client?.Address ?? string.Empty,

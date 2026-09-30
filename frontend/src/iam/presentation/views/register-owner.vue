@@ -10,10 +10,10 @@
           <h2 class="form-title">{{ $t('iam.registerOwner.title') }}</h2>
           <p class="form-subtitle">{{ $t('iam.registerOwner.subtitle') || 'Create your owner account to manage your properties.' }}</p>
 
-          <pv-stepper v-model:value="currentStep" linear>
-            <pv-step-list>
-              <pv-step :value="1">{{ $t('iam.registerOwner.userInfoSection') }}</pv-step>
-              <pv-step :value="2">{{ $t('iam.registerOwner.profileInfoSection') }}</pv-step>
+          <pv-stepper v-model:value="currentStep" linear role="group">
+            <pv-step-list role="tablist" :aria-label="$t('iam.registerOwner.title')">
+              <pv-step :value="1" :pt="{ root: { 'aria-current': null }, header: { 'aria-selected': currentStep === 1 } }">{{ $t('iam.registerOwner.userInfoSection') }}</pv-step>
+              <pv-step :value="2" :pt="{ root: { 'aria-current': null }, header: { 'aria-selected': currentStep === 2 } }">{{ $t('iam.registerOwner.profileInfoSection') }}</pv-step>
             </pv-step-list>
 
             <pv-step-panels>
@@ -30,8 +30,13 @@
               :placeholder="$t('iam.registerOwner.emailPlaceholder')"
               :invalid="!!fieldErrors.email"
               class="w-full"
+              @input="onOwnerEmailInput"
+              @blur="onEmailBlur"
             />
-            <small v-if="fieldErrors.email" class="p-error block mt-1">{{ fieldErrors.email }}</small>
+            <small v-if="fieldErrors.email" class="p-error block mt-1">
+              {{ fieldErrors.email }}
+              <a v-if="isEmailAlreadyRegistered" href="#" @click.prevent="goToLogin" class="text-green-500 font-semibold underline ml-1">Iniciar sesión</a>
+            </small>
           </div>
 
           <!-- Password -->
@@ -83,6 +88,9 @@
                     :label="'Next'"
                     icon="pi pi-arrow-right"
                     iconPos="right"
+                    :loading="checkingInvitation"
+                    :disabled="checkingInvitation || ownerUnitAssigned === false"
+                    :class="{ 'owner-next-button--unavailable': ownerUnitAssigned === false }"
                     @click="goToStep2"
                     class="flex-1"
                   />
@@ -250,7 +258,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useIamStore } from '../../application/iam.store.js';
 import { useProfileStore } from '../../../profiles/application/profile.store.js';
@@ -272,29 +280,13 @@ const iamApi = new IamApi();
 const currentStep = ref(1);
 const fieldErrors = ref({});
 
-import { CLOUDINARY_WIDGET_URL } from "../../../shared/infrastructure/constants.js";
+import { loadCloudinaryWidget } from "../../../shared/infrastructure/cloudinary-loader.js";
 import { getAvatarUploadConfig } from "../../../shared/infrastructure/cloudinary-config.js";
 
 // Cloudinary configuration
 const cloudinaryName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
 const cloudinaryPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
-const cloudinaryReady = ref(false);
-
-onMounted(() => {
-  loadCloudinaryScript();
-});
-
-const loadCloudinaryScript = () => {
-  if (window.cloudinary) {
-    cloudinaryReady.value = true;
-    return;
-  }
-  const script = document.createElement('script');
-  script.src = CLOUDINARY_WIDGET_URL;
-  script.type = 'text/javascript';
-  script.onload = () => { cloudinaryReady.value = true; };
-  document.head.appendChild(script);
-};
+let openingUpload = false;
 
 const fileInput = ref(null);
 
@@ -308,12 +300,15 @@ const handleLocalFileUpload = (event) => {
   reader.readAsDataURL(file);
 };
 
-const openUploadModal = () => {
+const openUploadModal = async () => {
+  if (openingUpload) return;
   const hasCloudinary = cloudinaryName && cloudinaryName.trim() !== '' && cloudinaryPreset && cloudinaryPreset.trim() !== '';
-  if (hasCloudinary && cloudinaryReady.value && window.cloudinary) {
+  if (hasCloudinary) {
+    openingUpload = true;
     try {
+      const cloudinary = await loadCloudinaryWidget();
       const widgetConfig = getAvatarUploadConfig(cloudinaryName, cloudinaryPreset);
-      window.cloudinary.openUploadWidget(
+      cloudinary.openUploadWidget(
         widgetConfig,
         (error, result) => {
           if (!error && result && result.event === "success") {
@@ -324,6 +319,8 @@ const openUploadModal = () => {
       return;
     } catch (err) {
       console.warn('Cloudinary widget failed, using local file picker:', err);
+    } finally {
+      openingUpload = false;
     }
   }
 
@@ -350,12 +347,55 @@ const errorMessage = ref('');
 const successMessage = ref('');
 const invitationInfo = ref(null);
 const checkingInvitation = ref(false);
+const isEmailAlreadyRegistered = ref(false);
+const ownerUnitAssigned = ref(null);
 
-async function checkBuilderAssignment(email) {
-  if (!email || !email.includes('@')) return;
+function onOwnerEmailInput() {
+  ownerUnitAssigned.value = null;
+  invitationInfo.value = null;
+  isEmailAlreadyRegistered.value = false;
+
+  if (fieldErrors.value.email === 'Tu correo electrónico no tiene una unidad asignada.' ||
+      fieldErrors.value.email === 'Este correo electrónico ya está registrado. Por favor inicia sesión.') {
+    fieldErrors.value.email = null;
+  }
+  if (errorMessage.value === 'Para registrarte como propietario, el constructor debe asignarte una unidad primero.' ||
+      errorMessage.value === 'Este correo electrónico ya cuenta con una cuenta de usuario.' ||
+      errorMessage.value === 'No se pudo verificar la unidad asignada. Inténtalo nuevamente.') {
+    errorMessage.value = '';
+  }
+}
+
+async function checkOwnerUnitAssignment(email) {
+  if (!email || !email.includes('@')) return false;
   try {
     checkingInvitation.value = true;
     const res = await iamApi.checkInvitation(email.trim());
+    if (res?.data?.alreadyRegistered) {
+      isEmailAlreadyRegistered.value = true;
+      ownerUnitAssigned.value = false;
+      invitationInfo.value = null;
+      fieldErrors.value.email = 'Este correo electrónico ya está registrado. Por favor inicia sesión.';
+      errorMessage.value = 'Este correo electrónico ya cuenta con una cuenta de usuario.';
+      return false;
+    }
+    isEmailAlreadyRegistered.value = false;
+    if (!res?.data?.assigned || !res?.data?.unitId) {
+      ownerUnitAssigned.value = false;
+      invitationInfo.value = null;
+      fieldErrors.value.email = 'Tu correo electrónico no tiene una unidad asignada.';
+      errorMessage.value = 'Para registrarte como propietario, el constructor debe asignarte una unidad primero.';
+      return false;
+    }
+    ownerUnitAssigned.value = true;
+    if (fieldErrors.value.email === 'Tu correo electrónico no tiene una unidad asignada.' ||
+        fieldErrors.value.email === 'Este correo electrónico ya está registrado. Por favor inicia sesión.') {
+      fieldErrors.value.email = null;
+    }
+    if (errorMessage.value === 'Para registrarte como propietario, el constructor debe asignarte una unidad primero.' ||
+        errorMessage.value === 'Este correo electrónico ya cuenta con una cuenta de usuario.') {
+      errorMessage.value = '';
+    }
     if (res?.data?.assigned) {
       invitationInfo.value = res.data;
       if (!registerForm.value.name && res.data.fullName) {
@@ -370,14 +410,26 @@ async function checkBuilderAssignment(email) {
     } else {
       invitationInfo.value = null;
     }
+    return true;
   } catch (err) {
-    console.debug('Invitation lookup failed or none found:', err);
+    console.debug('Invitation lookup failed or error:', err);
+    ownerUnitAssigned.value = false;
+    invitationInfo.value = null;
+    errorMessage.value = 'No se pudo verificar la unidad asignada. Inténtalo nuevamente.';
+    return false;
   } finally {
     checkingInvitation.value = false;
   }
 }
 
-function goToStep2() {
+async function onEmailBlur() {
+  const email = (registerForm.value.email || '').trim();
+  if (email && isValidEmail(email)) {
+    await checkOwnerUnitAssignment(email);
+  }
+}
+
+async function goToStep2() {
   errorMessage.value = '';
   fieldErrors.value = {};
 
@@ -408,9 +460,14 @@ function goToStep2() {
     return;
   }
 
+  // Check if email already registered before allowing step 2
+  const allowed = await checkOwnerUnitAssignment(email);
+  if (!allowed || isEmailAlreadyRegistered.value) {
+    return;
+  }
+
   registerForm.value.email = email;
   currentStep.value = 2;
-  checkBuilderAssignment(registerForm.value.email);
 }
 
 async function handleRegister() {
@@ -521,12 +578,19 @@ async function handleRegister() {
     });
     
     // Provide more specific error messages
-    if (error.message.includes('user ID')) {
+    if (error.response?.data?.code === 'owner_unit_assignment_required') {
+      errorMessage.value = 'Para registrarte como propietario, el constructor debe asignarte una unidad primero.';
+      fieldErrors.value.email = 'Tu correo electrónico no tiene una unidad asignada.';
+      currentStep.value = 1;
+    } else if (error.message.includes('user ID')) {
       errorMessage.value = 'Failed to complete registration. Please try logging in manually.';
-    } else if (error.response?.status === 409) {
-      errorMessage.value = 'Email already exists. Please try logging in instead.';
+    } else if (error.response?.status === 409 || error.response?.data?.error?.includes('already exists')) {
+      errorMessage.value = 'Este correo electrónico ya está registrado. Por favor inicie sesión.';
+      fieldErrors.value.email = 'Este correo electrónico ya cuenta con una cuenta registrada.';
+      isEmailAlreadyRegistered.value = true;
+      currentStep.value = 1;
     } else {
-      errorMessage.value = error.response?.data?.message || error.message || 'Registration failed. Please try again.';
+      errorMessage.value = error.response?.data?.message || error.response?.data?.error || error.message || 'Registration failed. Please try again.';
     }
   } finally {
     isLoading.value = false;
@@ -578,14 +642,11 @@ function goToLogin() {
 
 .form-content {
   width: 100%;
-  max-width: 28rem;
-  position: relative;
-  z-index: 1;
+  max-width: 550px;
 }
 
 .form-wrapper {
-  background: rgba(255, 255, 255, 0.95);
-  backdrop-filter: blur(10px);
+  background: white;
   padding: 2rem;
   border-radius: 1rem;
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
@@ -606,6 +667,14 @@ function goToLogin() {
 
 .step-content {
   padding: 1rem 0;
+}
+
+.owner-next-button--unavailable:disabled {
+  background-color: #9ca3af;
+  border-color: #9ca3af;
+  color: #ffffff;
+  cursor: not-allowed;
+  opacity: 1;
 }
 
 .mb-3 {

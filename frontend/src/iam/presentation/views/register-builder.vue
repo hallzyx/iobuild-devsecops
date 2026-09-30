@@ -10,10 +10,10 @@
           <h2 class="form-title">{{ $t('iam.registerBuilder.title') }}</h2>
           <p class="form-subtitle">{{ $t('iam.registerBuilder.subtitle') || 'Create your builder account to start managing projects.' }}</p>
 
-          <pv-stepper v-model:value="currentStep" linear>
-            <pv-step-list>
-              <pv-step :value="1">{{ $t('iam.registerBuilder.userInfoSection') }}</pv-step>
-              <pv-step :value="2">{{ $t('iam.registerBuilder.profileInfoSection') }}</pv-step>
+          <pv-stepper v-model:value="currentStep" linear role="group">
+            <pv-step-list role="tablist" :aria-label="$t('iam.registerBuilder.title')">
+              <pv-step :value="1" :pt="{ root: { 'aria-current': null }, header: { 'aria-selected': currentStep === 1 } }">{{ $t('iam.registerBuilder.userInfoSection') }}</pv-step>
+              <pv-step :value="2" :pt="{ root: { 'aria-current': null }, header: { 'aria-selected': currentStep === 2 } }">{{ $t('iam.registerBuilder.profileInfoSection') }}</pv-step>
             </pv-step-list>
 
             <pv-step-panels>
@@ -30,8 +30,12 @@
               :placeholder="$t('iam.registerBuilder.emailPlaceholder')"
               :invalid="!!fieldErrors.email"
               class="w-full"
+              @blur="onEmailBlur"
             />
-            <small v-if="fieldErrors.email" class="p-error block mt-1">{{ fieldErrors.email }}</small>
+            <small v-if="fieldErrors.email" class="p-error block mt-1">
+              {{ fieldErrors.email }}
+              <a v-if="isEmailAlreadyRegistered" href="#" @click.prevent="goToLogin" class="text-green-500 font-semibold underline ml-1">Iniciar sesión</a>
+            </small>
           </div>
 
           <!-- Password -->
@@ -83,6 +87,7 @@
                     :label="'Next'"
                     icon="pi pi-arrow-right"
                     iconPos="right"
+                    :loading="checkingEmail"
                     @click="goToStep2"
                     class="flex-1"
                   />
@@ -240,10 +245,11 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useIamStore } from '../../application/iam.store.js';
 import { useProfileStore } from '../../../profiles/application/profile.store.js';
+import { IamApi } from '../../infrastructure/iam-api.js';
 import {
   isValidEmail,
   isValidPhone,
@@ -256,33 +262,18 @@ import {
 const router = useRouter();
 const iamStore = useIamStore();
 const profileStore = useProfileStore();
+const iamApi = new IamApi();
 
 const currentStep = ref(1);
 const fieldErrors = ref({});
 
-import { CLOUDINARY_WIDGET_URL } from "../../../shared/infrastructure/constants.js";
+import { loadCloudinaryWidget } from "../../../shared/infrastructure/cloudinary-loader.js";
 import { getAvatarUploadConfig } from "../../../shared/infrastructure/cloudinary-config.js";
 
 // Cloudinary configuration
 const cloudinaryName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME;
 const cloudinaryPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET;
-const cloudinaryReady = ref(false);
-
-onMounted(() => {
-  loadCloudinaryScript();
-});
-
-const loadCloudinaryScript = () => {
-  if (window.cloudinary) {
-    cloudinaryReady.value = true;
-    return;
-  }
-  const script = document.createElement('script');
-  script.src = CLOUDINARY_WIDGET_URL;
-  script.type = 'text/javascript';
-  script.onload = () => { cloudinaryReady.value = true; };
-  document.head.appendChild(script);
-};
+let openingUpload = false;
 
 const fileInput = ref(null);
 
@@ -296,12 +287,15 @@ const handleLocalFileUpload = (event) => {
   reader.readAsDataURL(file);
 };
 
-const openUploadModal = () => {
+const openUploadModal = async () => {
+  if (openingUpload) return;
   const hasCloudinary = cloudinaryName && cloudinaryName.trim() !== '' && cloudinaryPreset && cloudinaryPreset.trim() !== '';
-  if (hasCloudinary && cloudinaryReady.value && window.cloudinary) {
+  if (hasCloudinary) {
+    openingUpload = true;
     try {
+      const cloudinary = await loadCloudinaryWidget();
       const widgetConfig = getAvatarUploadConfig(cloudinaryName, cloudinaryPreset);
-      window.cloudinary.openUploadWidget(
+      cloudinary.openUploadWidget(
         widgetConfig,
         (error, result) => {
           if (!error && result && result.event === "success") {
@@ -312,6 +306,8 @@ const openUploadModal = () => {
       return;
     } catch (err) {
       console.warn('Cloudinary widget failed, using local file picker:', err);
+    } finally {
+      openingUpload = false;
     }
   }
 
@@ -336,8 +332,30 @@ const registerForm = ref({
 const isLoading = ref(false);
 const errorMessage = ref('');
 const successMessage = ref('');
+const isEmailAlreadyRegistered = ref(false);
+const checkingEmail = ref(false);
 
-function goToStep2() {
+async function onEmailBlur() {
+  const email = (registerForm.value.email || '').trim();
+  if (email && isValidEmail(email)) {
+    try {
+      const res = await iamApi.checkInvitation(email);
+      if (res?.data?.alreadyRegistered) {
+        isEmailAlreadyRegistered.value = true;
+        fieldErrors.value.email = 'Este correo electrónico ya está registrado. Por favor inicia sesión.';
+        errorMessage.value = 'Este correo electrónico ya cuenta con una cuenta registrada.';
+      } else {
+        isEmailAlreadyRegistered.value = false;
+        if (fieldErrors.value.email === 'Este correo electrónico ya está registrado. Por favor inicia sesión.') {
+          fieldErrors.value.email = null;
+          errorMessage.value = '';
+        }
+      }
+    } catch (_) {}
+  }
+}
+
+async function goToStep2() {
   errorMessage.value = '';
   fieldErrors.value = {};
 
@@ -366,6 +384,21 @@ function goToStep2() {
   if (Object.keys(fieldErrors.value).length > 0) {
     errorMessage.value = 'Por favor complete correctamente los campos requeridos.';
     return;
+  }
+
+  try {
+    checkingEmail.value = true;
+    const res = await iamApi.checkInvitation(email);
+    if (res?.data?.alreadyRegistered) {
+      isEmailAlreadyRegistered.value = true;
+      fieldErrors.value.email = 'Este correo electrónico ya está registrado. Por favor inicia sesión.';
+      errorMessage.value = 'Este correo electrónico ya cuenta con una cuenta de usuario. Inicia sesión para acceder.';
+      return;
+    }
+    isEmailAlreadyRegistered.value = false;
+  } catch (_) {
+  } finally {
+    checkingEmail.value = false;
   }
 
   registerForm.value.email = email;
@@ -482,10 +515,13 @@ async function handleRegister() {
     // Provide more specific error messages
     if (error.message.includes('user ID')) {
       errorMessage.value = 'Failed to complete registration. Please try logging in manually.';
-    } else if (error.response?.status === 409) {
-      errorMessage.value = 'Email already exists. Please try logging in instead.';
+    } else if (error.response?.status === 409 || error.response?.data?.error?.includes('already exists')) {
+      errorMessage.value = 'Este correo electrónico ya está registrado. Por favor inicie sesión.';
+      fieldErrors.value.email = 'Este correo electrónico ya cuenta con una cuenta registrada.';
+      isEmailAlreadyRegistered.value = true;
+      currentStep.value = 1;
     } else {
-      errorMessage.value = error.response?.data?.message || error.message || 'Registration failed. Please try again.';
+      errorMessage.value = error.response?.data?.message || error.response?.data?.error || error.message || 'Registration failed. Please try again.';
     }
   } finally {
     isLoading.value = false;

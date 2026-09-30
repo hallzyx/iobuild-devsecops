@@ -1,3 +1,4 @@
+using System.Text.Json;
 using IoBuild.Api.Analytics.Domain.Model.Aggregates;
 using IoBuild.Api.Analytics.Domain.Model.Queries;
 using IoBuild.Api.Persistence;
@@ -48,7 +49,7 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
         if (devices.Count == 0) return new Dictionary<int, string>();
         var liveStatuses = await _liveDeviceStatusService.GetLatestStatusesAsync(devices.Select(d => d.DeviceId.ToString()), ct);
         var result = new Dictionary<int, string>();
-        var missingIds = new List<int>();
+        var missingDevices = new List<DeviceProjection>();
         foreach (var d in devices)
         {
             if (liveStatuses.TryGetValue(d.DeviceId.ToString(), out var s) && !string.IsNullOrWhiteSpace(s))
@@ -57,20 +58,40 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
             }
             else
             {
-                missingIds.Add(d.DeviceId);
+                missingDevices.Add(d);
             }
         }
-        if (missingIds.Count > 0)
+        if (missingDevices.Count > 0)
         {
-            var latestTelemetry = await _db.DeviceTelemetry
-                .Where(t => missingIds.Contains(t.DeviceId))
-                .GroupBy(t => t.DeviceId)
-                .Select(g => g.OrderByDescending(t => t.OccurredAt).Select(t => new { t.DeviceId, t.Status }).FirstOrDefault())
-                .ToListAsync(ct);
-            var teleMap = latestTelemetry.Where(x => x != null).ToDictionary(x => x!.DeviceId, x => x!.Status);
-            foreach (var d in devices.Where(d => missingIds.Contains(d.DeviceId)))
+            var missingIds = missingDevices.Select(d => d.DeviceId).ToList();
+            var shadows = await _db.DeviceShadows
+                .Where(s => missingIds.Contains(s.DeviceId))
+                .ToDictionaryAsync(s => s.DeviceId, ct);
+
+            foreach (var d in missingDevices)
             {
-                result[d.DeviceId] = teleMap.GetValueOrDefault(d.DeviceId, d.Status);
+                if (shadows.TryGetValue(d.DeviceId, out var devShadow) && devShadow.DesiredJson is { Length: > 0 } dj)
+                {
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(dj);
+                        if (doc.RootElement.TryGetProperty("power", out var p))
+                        {
+                            var isPowerOn = (p.ValueKind == JsonValueKind.True) ||
+                                            (p.ValueKind == JsonValueKind.String && p.GetString()?.Equals("on", StringComparison.OrdinalIgnoreCase) == true);
+                            result[d.DeviceId] = isPowerOn ? "online" : "idle";
+                            continue;
+                        }
+                    }
+                    catch { }
+                }
+
+                var latestStatus = await _db.DeviceTelemetry
+                    .Where(t => t.DeviceId == d.DeviceId)
+                    .OrderByDescending(t => t.OccurredAt)
+                    .Select(t => t.Status)
+                    .FirstOrDefaultAsync(ct);
+                result[d.DeviceId] = !string.IsNullOrWhiteSpace(latestStatus) ? latestStatus : d.Status;
             }
         }
         return result;
@@ -133,28 +154,43 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
             // Sync devices for these projects
             var realDevices = await _db.Devices.Where(d => pIds.Contains(d.ProjectId)).ToListAsync(ct);
             var dIds = realDevices.Select(d => d.Id).ToList();
-            var existingDeviceProjIds = await _db.DeviceProjections
+            var existingDeviceProjs = await _db.DeviceProjections
                 .Where(d => dIds.Contains(d.DeviceId))
-                .Select(d => d.DeviceId)
                 .ToListAsync(ct);
+            var existingProjMap = existingDeviceProjs.ToDictionary(p => p.DeviceId);
 
-            var missingDevices = realDevices.Where(d => !existingDeviceProjIds.Contains(d.Id)).ToList();
-            foreach (var d in missingDevices)
+            var updatedDevicesCount = 0;
+            foreach (var d in realDevices)
             {
-                _db.DeviceProjections.Add(new DeviceProjection
+                if (existingProjMap.TryGetValue(d.Id, out var existingProj))
                 {
-                    DeviceId = d.Id,
-                    ProjectId = d.ProjectId,
-                    UnitId = d.UnitId,
-                    DeviceName = d.Name,
-                    DeviceType = d.Type,
-                    Status = d.Status,
-                    OwnerUserId = d.OwnerId,
-                    LastEventAt = DateTime.UtcNow
-                });
+                    if (existingProj.DeviceType != d.Type || existingProj.DeviceName != d.Name || existingProj.ProjectId != d.ProjectId || existingProj.UnitId != d.UnitId)
+                    {
+                        existingProj.DeviceType = d.Type;
+                        existingProj.DeviceName = d.Name;
+                        existingProj.ProjectId = d.ProjectId;
+                        existingProj.UnitId = d.UnitId;
+                        updatedDevicesCount++;
+                    }
+                }
+                else
+                {
+                    _db.DeviceProjections.Add(new DeviceProjection
+                    {
+                        DeviceId = d.Id,
+                        ProjectId = d.ProjectId,
+                        UnitId = d.UnitId,
+                        DeviceName = d.Name,
+                        DeviceType = d.Type,
+                        Status = d.Status,
+                        OwnerUserId = d.OwnerId,
+                        LastEventAt = DateTime.UtcNow
+                    });
+                    updatedDevicesCount++;
+                }
             }
 
-            if (missingProjects.Count > 0 || missingUnits.Count > 0 || missingDevices.Count > 0)
+            if (missingProjects.Count > 0 || missingUnits.Count > 0 || updatedDevicesCount > 0)
             {
                 await _db.SaveChangesAsync(ct);
             }
@@ -198,41 +234,100 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
             };
         }).ToList<Dictionary<string, object>>();
 
+        var deviceIds = devices.Select(d => d.DeviceId).ToList();
         var hourlyEnergyData = new List<HistoricalDataPoint>();
         var monthlyOccupancy = new List<HistoricalDataPoint>();
         var temperatureHistory = new List<HistoricalDataPoint>();
 
         if (activeProjectsCount > 0)
         {
-            // Monthly occupancy: last 6 months
+            var now = DateTime.UtcNow;
+
+            // Monthly occupancy: last 6 months (based on real occupancy rate and project timeline)
+            var projectStartDates = realProjects.Select(p => p.CreatedAt.UtcDateTime).ToList();
+            var earliestProject = projectStartDates.Count > 0 ? projectStartDates.Min() : now;
+            var earliestMonthStart = new DateTime(earliestProject.Year, earliestProject.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+
             for (int m = 5; m >= 0; m--)
             {
-                var monthDate = DateTime.UtcNow.AddMonths(-m);
+                var monthDate = now.AddMonths(-m);
                 var startOfMonth = new DateTime(monthDate.Year, monthDate.Month, 1, 0, 0, 0, DateTimeKind.Utc);
-                var factor = m == 0 ? 1.0 : Math.Max(0.2, 1.0 - (m * 0.15));
-                var rate = Math.Round(occupancyRate * factor, 1);
-                monthlyOccupancy.Add(new HistoricalDataPoint { Timestamp = startOfMonth, Value = rate, Metric = "occupancy" });
+                if (startOfMonth < earliestMonthStart) continue;
+
+                monthlyOccupancy.Add(new HistoricalDataPoint { Timestamp = startOfMonth, Value = Math.Round(occupancyRate, 1), Metric = "occupancy" });
             }
 
-            // Hourly energy: last 24 hours
-            var now = DateTime.UtcNow;
-            for (int h = 23; h >= 0; h--)
+            // Real Hourly energy: last 24 hours from actual device telemetry
+            var last24h = now.AddHours(-24);
+            var telemetry24h = deviceIds.Count > 0
+                ? await _db.DeviceTelemetry
+                    .Where(t => deviceIds.Contains(t.DeviceId) && t.OccurredAt >= last24h)
+                    .Select(t => new { t.OccurredAt, t.EnergyKwh, t.TemperatureC })
+                    .ToListAsync(ct)
+                : [];
+
+            if (telemetry24h.Count > 0)
             {
-                var hourTime = now.AddHours(-h);
-                var val = Math.Round(totalDevices > 0 ? (1.2 + (h % 6) * 0.3 + (totalDevices * 0.05)) : 0.0, 2);
-                hourlyEnergyData.Add(new HistoricalDataPoint { Timestamp = hourTime, Value = val, Metric = "energy" });
+                var hourGroups = telemetry24h
+                    .GroupBy(t => new DateTime(t.OccurredAt.Year, t.OccurredAt.Month, t.OccurredAt.Day, t.OccurredAt.Hour, 0, 0, DateTimeKind.Utc))
+                    .OrderBy(g => g.Key);
+
+                foreach (var g in hourGroups)
+                {
+                    hourlyEnergyData.Add(new HistoricalDataPoint
+                    {
+                        Timestamp = g.Key,
+                        Value = Math.Round(g.Sum(t => t.EnergyKwh), 2),
+                        Metric = "energy"
+                    });
+                }
             }
 
-            // Temperature trend: last 7 days
-            for (int d = 6; d >= 0; d--)
+            // Temperature devices: only devices measuring ambient/building temperature
+            var tempDeviceIds = devices
+                .Where(d => !string.IsNullOrEmpty(d.DeviceType) &&
+                            (d.DeviceType.Equals("Temperature", StringComparison.OrdinalIgnoreCase) ||
+                             d.DeviceType.Equals("TemperatureSensor", StringComparison.OrdinalIgnoreCase) ||
+                             d.DeviceType.Equals("Thermostat", StringComparison.OrdinalIgnoreCase) ||
+                             d.DeviceType.Equals("TempSensor", StringComparison.OrdinalIgnoreCase) ||
+                             d.DeviceType.Equals("ClimateSensor", StringComparison.OrdinalIgnoreCase) ||
+                             d.DeviceType.IndexOf("Temperature", StringComparison.OrdinalIgnoreCase) >= 0))
+                .Select(d => d.DeviceId)
+                .ToList();
+
+            // Real Temperature trend: last 7 days from actual temperature device telemetry
+            var last7d = now.AddDays(-7);
+            var telemetry7d = tempDeviceIds.Count > 0
+                ? await _db.DeviceTelemetry
+                    .Where(t => tempDeviceIds.Contains(t.DeviceId) && t.OccurredAt >= last7d && t.TemperatureC > 0)
+                    .Select(t => new { t.OccurredAt, t.TemperatureC })
+                    .ToListAsync(ct)
+                : [];
+
+            if (telemetry7d.Count > 0)
             {
-                var dayTime = now.AddDays(-d).Date;
-                var temp = Math.Round(22.0 + Math.Sin(d) * 2.5, 1);
-                temperatureHistory.Add(new HistoricalDataPoint { Timestamp = dayTime, Value = temp, Metric = "temperature" });
+                var earliestTempDate = telemetry7d.Min(t => t.OccurredAt.Date);
+                var startDate = earliestTempDate > now.AddDays(-6).Date ? earliestTempDate : now.AddDays(-6).Date;
+                for (var d = startDate; d <= now.Date; d = d.AddDays(1))
+                {
+                    var dayReadings = telemetry7d.Where(t => t.OccurredAt.Date == d).ToList();
+                    if (dayReadings.Count > 0)
+                    {
+                        temperatureHistory.Add(new HistoricalDataPoint
+                        {
+                            Timestamp = d,
+                            Value = Math.Round(dayReadings.Average(t => t.TemperatureC), 1),
+                            Metric = "temperature"
+                        });
+                    }
+                }
             }
         }
 
-        var avgEnergy = hourlyEnergyData.Count > 0 ? Math.Round(hourlyEnergyData.Average(h => h.Value), 1) : 0.0;
+        var activeHours = hourlyEnergyData.Where(h => h.Value > 0).ToList();
+        var avgEnergy = activeHours.Count > 0
+            ? Math.Round(activeHours.Average(h => h.Value), 2)
+            : 0.0;
 
         return new BuilderMetrics
         {
@@ -395,52 +490,102 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
         }).ToList<Dictionary<string, object>>();
 
         var deviceIds = devices.Select(d => d.DeviceId).ToList();
+        var now = DateTime.UtcNow;
+        var startOf30Days = now.AddDays(-30);
+
         var telemetry = deviceIds.Count > 0
             ? await _db.DeviceTelemetry
-                .Where(t => deviceIds.Contains(t.DeviceId))
-                .OrderByDescending(t => t.OccurredAt)
-                .Take(500)
+                .Where(t => deviceIds.Contains(t.DeviceId) && t.OccurredAt >= startOf30Days)
+                .Select(t => new { t.DeviceId, t.OccurredAt, t.EnergyKwh, t.TemperatureC })
                 .ToListAsync(ct)
             : [];
 
-        var avgTemp = telemetry.Count > 0 ? Math.Round(telemetry.Average(t => t.TemperatureC), 1) : 23.5;
-        var sumEnergy = telemetry.Count > 0 ? Math.Round(telemetry.Sum(t => t.EnergyKwh), 2) : 0.0;
-        var energyThisMonth = Math.Round(142.5 + sumEnergy, 1);
-        var waterUsageThisMonth = Math.Round(12.4 + (myUnitsCount * 3.2), 1);
+        var validTempReadings = telemetry.Where(t => t.TemperatureC > 0).ToList();
+        var avgTemp = validTempReadings.Count > 0 ? Math.Round(validTempReadings.Average(t => t.TemperatureC), 1) : 0.0;
 
-        var now = DateTime.UtcNow;
+        var startOfCurrentMonth = new DateTime(now.Year, now.Month, 1, 0, 0, 0, DateTimeKind.Utc);
+        var currentMonthReadings = telemetry.Where(t => t.OccurredAt >= startOfCurrentMonth).ToList();
+        var energyThisMonth = currentMonthReadings.Count > 0
+            ? Math.Round(currentMonthReadings.Sum(t => t.EnergyKwh), 2)
+            : (telemetry.Count > 0 ? Math.Round(telemetry.Sum(t => t.EnergyKwh), 2) : 0.0);
 
-        // Daily energy: last 30 days
+        // Water devices
+        var waterDeviceIds = devices
+            .Where(d => d.DeviceType.Contains("Water", StringComparison.OrdinalIgnoreCase))
+            .Select(d => d.DeviceId)
+            .ToHashSet();
+
+        var waterReadingsThisMonth = currentMonthReadings.Where(t => waterDeviceIds.Contains(t.DeviceId)).ToList();
+        var waterUsageThisMonth = waterReadingsThisMonth.Count > 0
+            ? Math.Round(waterReadingsThisMonth.Sum(t => t.EnergyKwh), 2)
+            : (waterDeviceIds.Count > 0 ? Math.Round(telemetry.Where(t => waterDeviceIds.Contains(t.DeviceId)).Sum(t => t.EnergyKwh), 2) : 0.0);
+
+        // Daily energy: last 30 days (only from dates with real readings)
         var dailyEnergyConsumption = new List<HistoricalDataPoint>();
-        for (int d = 29; d >= 0; d--)
+        if (telemetry.Count > 0)
         {
-            var dayDate = now.AddDays(-d).Date;
-            var dayReadings = telemetry.Where(t => t.OccurredAt.Date == dayDate).ToList();
-            var dayVal = dayReadings.Count > 0
-                ? Math.Round(dayReadings.Sum(t => t.EnergyKwh) * 20, 2)
-                : Math.Round(4.2 + Math.Sin(d * 0.5) * 1.2 + (totalDevices * 0.3), 2);
-            dailyEnergyConsumption.Add(new HistoricalDataPoint { Timestamp = dayDate, Value = dayVal, Metric = "energy" });
+            var earliestEnergyDate = telemetry.Min(t => t.OccurredAt.Date);
+            var startDate = earliestEnergyDate > now.AddDays(-29).Date ? earliestEnergyDate : now.AddDays(-29).Date;
+            for (var d = startDate; d <= now.Date; d = d.AddDays(1))
+            {
+                var dayReadings = telemetry.Where(t => t.OccurredAt.Date == d).ToList();
+                if (dayReadings.Count > 0)
+                {
+                    dailyEnergyConsumption.Add(new HistoricalDataPoint
+                    {
+                        Timestamp = d,
+                        Value = Math.Round(dayReadings.Sum(t => t.EnergyKwh), 2),
+                        Metric = "energy"
+                    });
+                }
+            }
         }
 
-        // Temperature comfort: last 7 days
+        // Temperature comfort: last 7 days (only from dates with real readings)
         var temperatureHistory = new List<HistoricalDataPoint>();
-        for (int d = 6; d >= 0; d--)
+        if (validTempReadings.Count > 0)
         {
-            var dayDate = now.AddDays(-d).Date;
-            var dayReadings = telemetry.Where(t => t.OccurredAt.Date == dayDate).ToList();
-            var tempVal = dayReadings.Count > 0
-                ? Math.Round(dayReadings.Average(t => t.TemperatureC), 1)
-                : Math.Round(avgTemp + Math.Sin(d) * 1.5, 1);
-            temperatureHistory.Add(new HistoricalDataPoint { Timestamp = dayDate, Value = tempVal, Metric = "temperature" });
+            var temp7d = validTempReadings.Where(t => t.OccurredAt >= now.AddDays(-7)).ToList();
+            if (temp7d.Count > 0)
+            {
+                var earliestTempDate = temp7d.Min(t => t.OccurredAt.Date);
+                var startDate = earliestTempDate > now.AddDays(-6).Date ? earliestTempDate : now.AddDays(-6).Date;
+                for (var d = startDate; d <= now.Date; d = d.AddDays(1))
+                {
+                    var dayReadings = temp7d.Where(t => t.OccurredAt.Date == d).ToList();
+                    if (dayReadings.Count > 0)
+                    {
+                        temperatureHistory.Add(new HistoricalDataPoint
+                        {
+                            Timestamp = d,
+                            Value = Math.Round(dayReadings.Average(t => t.TemperatureC), 1),
+                            Metric = "temperature"
+                        });
+                    }
+                }
+            }
         }
 
-        // Water usage: last 7 days (by day of week)
+        // Water usage: last 7 days (only from dates with real water readings)
         var waterUsageWeekly = new List<HistoricalDataPoint>();
-        for (int d = 6; d >= 0; d--)
+        var waterReadings = telemetry.Where(t => waterDeviceIds.Contains(t.DeviceId)).ToList();
+        if (waterReadings.Count > 0)
         {
-            var dayDate = now.AddDays(-d).Date;
-            var waterVal = Math.Round(0.42 + (d % 3) * 0.12 + (myUnitsCount * 0.1), 2);
-            waterUsageWeekly.Add(new HistoricalDataPoint { Timestamp = dayDate, Value = waterVal, Metric = "water" });
+            var earliestWaterDate = waterReadings.Min(t => t.OccurredAt.Date);
+            var startDate = earliestWaterDate > now.AddDays(-6).Date ? earliestWaterDate : now.AddDays(-6).Date;
+            for (var d = startDate; d <= now.Date; d = d.AddDays(1))
+            {
+                var dayReadings = waterReadings.Where(t => t.OccurredAt.Date == d).ToList();
+                if (dayReadings.Count > 0)
+                {
+                    waterUsageWeekly.Add(new HistoricalDataPoint
+                    {
+                        Timestamp = d,
+                        Value = Math.Round(dayReadings.Sum(t => t.EnergyKwh), 2),
+                        Metric = "water"
+                    });
+                }
+            }
         }
 
         return new OwnerMetrics
@@ -509,7 +654,7 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
         return telemetry
             .GroupBy(t => new DateTime(t.OccurredAt.Year, t.OccurredAt.Month, t.OccurredAt.Day, t.OccurredAt.Hour, t.OccurredAt.Minute, 0, DateTimeKind.Utc))
             .OrderBy(g => g.Key)
-            .Select(g => new EnergyMinutePoint(g.Key, Math.Round(g.Average(t => t.EnergyKwh) * intIds.Count, 3)));
+            .Select(g => new EnergyMinutePoint(g.Key, Math.Round(g.Sum(t => t.EnergyKwh), 3)));
     }
 
     public async Task<IEnumerable<EnergyMinutePoint>> Handle(GetOwnerLiveEnergyQuery query, CancellationToken ct = default)
@@ -553,6 +698,6 @@ public sealed class AnalyticsQueryService : IAnalyticsQueryService
         return telemetry
             .GroupBy(t => new DateTime(t.OccurredAt.Year, t.OccurredAt.Month, t.OccurredAt.Day, t.OccurredAt.Hour, t.OccurredAt.Minute, 0, DateTimeKind.Utc))
             .OrderBy(g => g.Key)
-            .Select(g => new EnergyMinutePoint(g.Key, Math.Round(g.Average(t => t.EnergyKwh) * intIds.Count, 3)));
+            .Select(g => new EnergyMinutePoint(g.Key, Math.Round(g.Sum(t => t.EnergyKwh), 3)));
     }
 }

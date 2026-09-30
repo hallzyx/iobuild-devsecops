@@ -1,5 +1,15 @@
 # Profiles evidence ledger
 
+See the [crosscutting frontend performance report](../../performance/evidence-ledger.md)
+for shared gzip/cache/chunks, functional E2E evidence and the new local
+mobile/desktop Lighthouse audit of `/profiles/profile` for Builder and Owner.
+The original two-route IAM comparison is preserved separately. Local observations
+do not establish CI acceptance or all-state performance coverage.
+
+Surgical round two links both-role fields/language controls and improves shared
+action contrast: A100 for both measured profile views, with save/reload/locale
+regressions in the repeated full E2E suite. Details and CI limits are central.
+
 ```yaml
 context: profiles
 status: piloted
@@ -69,4 +79,13 @@ roles_covered:
     happy_path: frontend/tests/e2e/profiles-manage.spec.js (Builder test)
   - role: Owner
     happy_path: frontend/tests/e2e/profiles-manage.spec.js (Owner test)
+owner_assignment_regression:
+  cause: Owner profile E2E attempted registration without provisioning an assigned unit after IAM eligibility changed; Next correctly stayed disabled.
+  repair: Owner fixture now provisions an actual builder, project, unit, and client assignment before the UI registration.
+  commands:
+    - command: E2E_BASE_URL=http://localhost:8081 npx playwright test tests/e2e/profiles-manage.spec.js tests/e2e/iam-happy-path.spec.js tests/e2e/iam-form-feedback.spec.js
+      result: 7/7 passed against isolated MySQL 8 Compose stack.
+    - command: E2E_BASE_URL=http://localhost:8081 npx playwright test
+      result: 13/13 passed against isolated MySQL 8 Compose stack.
+  delivery_note: CI rerun remains pending; local evidence is not CI evidence.
 ```
